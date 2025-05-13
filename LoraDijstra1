@@ -1,0 +1,188 @@
+#include "LoRaWan_APP.h"
+#include <Arduino.h>
+#include <vector>
+#include <queue>
+#include <climits>
+#include <string>
+#include <algorithm>
+
+#define RF_FREQUENCY 915000000
+#define TX_OUTPUT_POWER 14
+#define LORA_BANDWIDTH 0
+#define LORA_SPREADING_FACTOR 7
+#define LORA_CODINGRATE 1
+#define LORA_PREAMBLE_LENGTH 8
+#define LORA_SYMBOL_TIMEOUT 0
+#define LORA_FIX_LENGTH_PAYLOAD_ON false
+#define LORA_IQ_INVERSION_ON false
+#define RX_TIMEOUT_VALUE 1000
+#define BUFFER_SIZE 64
+
+char txpacket[BUFFER_SIZE];
+char rxpacket[BUFFER_SIZE];
+bool lora_idle = true;
+
+static RadioEvents_t RadioEvents;
+void OnTxDone(void);
+void OnTxTimeout(void);
+
+// ----- Dynamic Graph and Routing -----
+class DynamicGraph {
+public:
+    std::vector<std::vector<std::pair<int, int>>> adjList;
+    std::vector<int> vertex;
+
+    int rssiToCost(int rssi) {
+        return std::max(1, 120 - abs(rssi));
+    }
+
+    void addVertex(int node) {
+        if (node >= vertex.size()) {
+            vertex.resize(node + 1);
+            adjList.resize(node + 1);
+        }
+        vertex[node] = node;
+    }
+
+    void addEdge(int u, int v, int rssi, bool bidirectional = true) {
+        addVertex(u);
+        addVertex(v);
+        int cost = rssiToCost(rssi);
+
+        auto removeEdge = [](std::vector<std::pair<int,int>> &neighbors, int node) {
+            neighbors.erase(
+                std::remove_if(neighbors.begin(), neighbors.end(),
+                    [node](const std::pair<int,int> &p) { return p.first == node; }),
+                neighbors.end());
+        };
+
+        removeEdge(adjList[u], v);
+        adjList[u].push_back({v, cost});
+
+        if (bidirectional) {
+            removeEdge(adjList[v], u);
+            adjList[v].push_back({u, cost});
+        }
+
+        Serial.printf("Edge added: %d <--> %d with cost %d\n", u, v, cost);
+    }
+
+    std::vector<int> dijkstra(int src, int target) {
+        int n = vertex.size();
+        std::vector<int> dist(n, INT_MAX);
+        std::vector<int> parent(n, -1);
+        std::vector<bool> visited(n, false);
+
+        std::priority_queue<std::pair<int, int>, std::vector<std::pair<int, int>>, std::greater<>> pq;
+        dist[src] = 0;
+        pq.push({0, src});
+
+        while (!pq.empty()) {
+            int u = pq.top().second;
+            pq.pop();
+            if (visited[u]) continue;
+            visited[u] = true;
+            if (u == target) break;
+
+            for (auto &edge : adjList[u]) {
+                int v = edge.first;
+                int weight = edge.second;
+                if (!visited[v] && dist[u] + weight < dist[v]) {
+                    dist[v] = dist[u] + weight;
+                    parent[v] = u;
+                    pq.push({dist[v], v});
+                }
+            }
+        }
+
+        std::vector<int> path;
+        if (dist[target] == INT_MAX) {
+            Serial.println("❌ No path found.");
+            return path;
+        }
+
+        for (int crawl = target; crawl != -1; crawl = parent[crawl])
+            path.push_back(crawl);
+
+        std::reverse(path.begin(), path.end());
+        Serial.print("Routing path: ");
+        for (size_t i = 0; i < path.size(); ++i) {
+            Serial.print(vertex[path[i]]);
+            if (i != path.size()-1)
+                Serial.print(" -> ");
+        }
+        Serial.printf(", Distance: %d\n", dist[target]);
+        return path;
+    }
+};
+
+DynamicGraph network;
+
+void setup() {
+    Serial.begin(115200);
+    Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
+
+    RadioEvents.TxDone = OnTxDone;
+    RadioEvents.TxTimeout = OnTxTimeout;
+
+    Radio.Init(&RadioEvents);
+    Radio.SetChannel(RF_FREQUENCY);
+    Radio.SetTxConfig(MODEM_LORA, TX_OUTPUT_POWER, 0, LORA_BANDWIDTH,
+                      LORA_SPREADING_FACTOR, LORA_CODINGRATE,
+                      LORA_PREAMBLE_LENGTH, LORA_FIX_LENGTH_PAYLOAD_ON,
+                      true, 0, 0, LORA_IQ_INVERSION_ON, 3000);
+
+    // Example topology
+    network.addEdge(3, 0, -60);
+    network.addEdge(3, 4, -90);
+    network.addEdge(0, 2, -75);
+    network.addEdge(0, 4, -85);
+    network.addEdge(4, 2, -80);
+    network.addEdge(4, 6, -95);
+    network.addEdge(2, 5, -70);
+    network.addEdge(2, 1, -88);
+    network.addEdge(1, 5, -89);
+    network.addEdge(6, 5, -92);
+    network.addEdge(6, 8, -100);
+    network.addEdge(6, 7, -97);
+    network.addEdge(8, 9, -93);
+}
+
+void loop() {
+    if (lora_idle) {
+        delay(10000);
+        std::vector<int> path = network.dijkstra(9, 0);
+        if (path.size() < 2) return;
+
+        String message = "Hello from node " + String(path[0]);
+
+        for (size_t i = 0; i < path.size() - 1; ++i) {
+            int from = network.vertex[path[i]];
+            int to = network.vertex[path[i + 1]];
+
+            snprintf(txpacket, BUFFER_SIZE, "%d -> %d: %s", from, to, message.c_str());
+            Serial.printf("\r\nsending packet \"%s\"\r\n", txpacket);
+
+            Radio.Send((uint8_t *)txpacket, strlen(txpacket));
+            lora_idle = false;
+
+            while (!lora_idle) {
+                Radio.IrqProcess();
+            }
+
+            delay(500);
+        }
+    }
+    Radio.IrqProcess();
+}
+
+void OnTxDone(void) {
+    Serial.println("TX done......");
+    lora_idle = true;
+}
+
+void OnTxTimeout(void) {
+    Radio.Sleep();
+    Serial.println("TX Timeout......");
+    lora_idle = true;
+}
