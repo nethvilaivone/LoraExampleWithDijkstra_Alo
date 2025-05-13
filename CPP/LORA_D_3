@@ -1,0 +1,287 @@
+#include "LoRaWan_APP.h"
+#include <Arduino.h>
+#include <vector>
+#include <queue>
+#include <map>
+#include <algorithm>
+#include <string>
+
+#define MY_NODE_ID 4  // change per device
+#define RF_FREQUENCY 915000000
+#define TX_OUTPUT_POWER 14
+#define LORA_BANDWIDTH 0
+#define LORA_SPREADING_FACTOR 7
+#define LORA_CODINGRATE 1
+#define LORA_PREAMBLE_LENGTH 8
+#define LORA_SYMBOL_TIMEOUT 0
+#define LORA_FIX_LENGTH_PAYLOAD_ON false
+#define LORA_IQ_INVERSION_ON false
+#define RX_TIMEOUT_VALUE 1000
+#define BUFFER_SIZE 128
+
+// === Feature Flags ===
+#define USE_TTL            true
+#define DEFAULT_TTL        5
+#define ENABLE_MSG_CACHE   true
+#define ENABLE_ROUTE_CACHE true
+#define ENABLE_SLEEP       true
+
+char txpacket[BUFFER_SIZE];
+char rxpacket[BUFFER_SIZE];
+bool lora_idle = true;
+
+static RadioEvents_t RadioEvents;
+void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr);
+void OnTxDone(void);
+void OnTxTimeout(void);
+
+// === Edge Structure with Timestamp ===
+struct Edge {
+    int neighbor;
+    int cost;
+    unsigned long lastUpdated;
+};
+
+// === Dynamic Graph with Dijkstra ===
+class DynamicGraph {
+public:
+    std::vector<std::vector<Edge>> adjList;
+
+    int rssiToCost(int rssi) {
+        return std::max(1, 120 - abs(rssi));
+    }
+   void pruneStaleEdges(unsigned long maxAgeMillis = 30000) {
+    unsigned long now = millis();
+    for (auto& neighbors : adjList) {
+        neighbors.erase(std::remove_if(neighbors.begin(), neighbors.end(),
+            [now, maxAgeMillis](const Edge& edge) {
+                return (now - edge.lastUpdated > maxAgeMillis);
+            }), neighbors.end());
+    }
+}
+
+    void addVertex(int node) {
+        if (node >= adjList.size()) {
+            adjList.resize(node + 1);
+        }
+    }
+
+    void addEdge(int u, int v, int rssi, bool bidirectional = true) {
+        addVertex(u);
+        addVertex(v);
+        int cost = rssiToCost(rssi);
+        unsigned long now = millis();
+
+        auto& neighborsU = adjList[u];
+        auto& neighborsV = adjList[v];
+
+        auto updateOrAdd = [](std::vector<Edge>& neighbors, int node, int cost, unsigned long now) {
+            for (auto& edge : neighbors) {
+                if (edge.neighbor == node) {
+                    edge.cost = cost;
+                    edge.lastUpdated = now;
+                    return;
+                }
+            }
+            neighbors.push_back({node, cost, now});
+        };
+
+        updateOrAdd(neighborsU, v, cost, now);
+        if (bidirectional) {
+            updateOrAdd(neighborsV, u, cost, now);
+        }
+    }
+
+    std::vector<int> dijkstra(int src, int target) {
+        int n = adjList.size();
+        if (src >= n || target >= n) return {};
+
+        std::vector<int> dist(n, INT_MAX), parent(n, -1);
+        std::vector<bool> visited(n, false);
+        std::priority_queue<std::pair<int, int>, std::vector<std::pair<int, int>>, std::greater<>> pq;
+
+        dist[src] = 0;
+        pq.push({0, src});
+
+        while (!pq.empty()) {
+            int u = pq.top().second;
+            pq.pop();
+            if (visited[u]) continue;
+            visited[u] = true;
+            if (u == target) break;
+
+            for (const auto& edge : adjList[u]) {
+                int v = edge.neighbor;
+                int weight = edge.cost;
+                if (!visited[v] && dist[u] + weight < dist[v]) {
+                    dist[v] = dist[u] + weight;
+                    parent[v] = u;
+                    pq.push({dist[v], v});
+                }
+            }
+        }
+
+        if (dist[target] == INT_MAX) return {};
+
+        std::vector<int> path;
+        for (int crawl = target; crawl != -1; crawl = parent[crawl]) {
+            path.push_back(crawl);
+        }
+        std::reverse(path.begin(), path.end());
+        return path;
+    }
+};
+
+
+DynamicGraph network;
+std::map<int, std::vector<int>> routeCache;        // Route caching
+std::vector<String> recentMessages;                // Deduplication
+unsigned long lastPrune = 0;
+unsigned long lastBeacon = 0;
+
+void setup() {
+    Serial.begin(115200);
+    Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
+
+    RadioEvents.RxDone = OnRxDone;
+    RadioEvents.TxDone = OnTxDone;
+    RadioEvents.TxTimeout = OnTxTimeout;
+
+    Radio.Init(&RadioEvents);
+    Radio.SetChannel(RF_FREQUENCY);
+
+    Radio.SetRxConfig(MODEM_LORA, LORA_BANDWIDTH, LORA_SPREADING_FACTOR,
+                      LORA_CODINGRATE, 0, LORA_PREAMBLE_LENGTH,
+                      LORA_SYMBOL_TIMEOUT, LORA_FIX_LENGTH_PAYLOAD_ON,
+                      0, true, 0, 0, LORA_IQ_INVERSION_ON, true);
+
+    Serial.printf("🚀 Node %d online.\n", MY_NODE_ID);
+    network.addVertex(MY_NODE_ID);
+    Radio.Rx(0);
+}
+
+void loop() {
+    Radio.IrqProcess();
+
+    // Send periodic beacon
+    if (millis() - lastBeacon > 10000 && lora_idle) {
+        snprintf(txpacket, BUFFER_SIZE, "%d -> 255 | ttl=%d: hello", MY_NODE_ID, DEFAULT_TTL);
+        Serial.printf("📡 Beacon: %s\n", txpacket);
+
+        Radio.SetTxConfig(MODEM_LORA, TX_OUTPUT_POWER, 0, LORA_BANDWIDTH,
+                          LORA_SPREADING_FACTOR, LORA_CODINGRATE,
+                          LORA_PREAMBLE_LENGTH, LORA_FIX_LENGTH_PAYLOAD_ON,
+                          true, 0, 0, LORA_IQ_INVERSION_ON, 3000);
+        Radio.Send((uint8_t *)txpacket, strlen(txpacket));
+        lora_idle = false;
+        lastBeacon = millis();
+    }
+
+    // Prune stale edges
+    if (millis() - lastPrune > 15000) {
+        network.pruneStaleEdges(30000);
+        routeCache.clear();  // flush outdated paths
+        lastPrune = millis();
+    }
+
+    if (ENABLE_SLEEP && lora_idle) {
+        esp_sleep_enable_timer_wakeup(5000000); // 5 sec
+        Serial.println("💤 Sleeping...");
+        esp_light_sleep_start();
+    }
+}
+void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
+    memcpy(rxpacket, payload, size);
+    rxpacket[size] = '\0';
+
+    Serial.printf("\n📥 Received: \"%s\" (RSSI: %d)\n", rxpacket, rssi);
+
+    String packet = String(rxpacket);
+    int arrowPos = packet.indexOf(" -> ");
+    int ttlPos = packet.indexOf("ttl=");
+    int colonPos = packet.indexOf(": ");
+
+    if (arrowPos == -1 || colonPos == -1) {
+        Serial.println("⚠️ Invalid format.");
+        Radio.Rx(0);
+        return;
+    }
+
+    int fromID = packet.substring(0, arrowPos).toInt();
+    int toID   = packet.substring(arrowPos + 4, ttlPos != -1 ? ttlPos - 1 : colonPos).toInt();
+    int ttl = DEFAULT_TTL;
+    if (USE_TTL && ttlPos != -1 && colonPos > ttlPos)
+        ttl = packet.substring(ttlPos + 4, colonPos).toInt();
+    String message = packet.substring(colonPos + 2);
+
+    String msgID = String(fromID) + "-" + String(toID) + "-" + message;
+    if (ENABLE_MSG_CACHE &&
+        std::find(recentMessages.begin(), recentMessages.end(), msgID) != recentMessages.end()) {
+        Serial.println("🔁 Duplicate message. Ignored.");
+        Radio.Rx(0);
+        return;
+    }
+
+    if (ENABLE_MSG_CACHE) {
+        recentMessages.push_back(msgID);
+        if (recentMessages.size() > 20)
+            recentMessages.erase(recentMessages.begin());
+    }
+
+    network.addVertex(fromID);
+    network.addVertex(toID);
+    network.addEdge(fromID, MY_NODE_ID, rssi);
+
+    if (toID == 255) {
+        Serial.println("📶 Beacon received.");
+        Radio.Rx(0);
+        return;
+    }
+
+    if (toID == MY_NODE_ID) {
+        Serial.printf("✅ Message for me: %s\n", message.c_str());
+    } else if (USE_TTL && ttl <= 0) {
+        Serial.println("⛔ TTL expired.");
+    } else {
+        std::vector<int> path;
+        if (ENABLE_ROUTE_CACHE && routeCache.count(toID)) {
+            path = routeCache[toID];
+        } else {
+            path = network.dijkstra(MY_NODE_ID, toID);
+            if (!path.empty() && ENABLE_ROUTE_CACHE)
+                routeCache[toID] = path;
+        }
+
+        if (path.size() >= 2) {
+            int nextHop = path[1];
+            ttl = USE_TTL ? ttl - 1 : DEFAULT_TTL;
+            snprintf(txpacket, BUFFER_SIZE, "%d -> %d | ttl=%d: %s", MY_NODE_ID, toID, ttl, message.c_str());
+            Serial.printf("🔁 Forwarding to %d: \"%s\"\n", nextHop, txpacket);
+
+            Radio.SetTxConfig(MODEM_LORA, TX_OUTPUT_POWER, 0, LORA_BANDWIDTH,
+                              LORA_SPREADING_FACTOR, LORA_CODINGRATE,
+                              LORA_PREAMBLE_LENGTH, LORA_FIX_LENGTH_PAYLOAD_ON,
+                              true, 0, 0, LORA_IQ_INVERSION_ON, 3000);
+
+            Radio.Send((uint8_t *)txpacket, strlen(txpacket));
+            lora_idle = false;
+        } else {
+            Serial.println("❌ No route to forward.");
+        }
+    }
+
+    Radio.Rx(0);
+}
+
+void OnTxDone(void) {
+    Serial.println("✅ TX complete");
+    lora_idle = true;
+    Radio.Rx(0);
+}
+
+void OnTxTimeout(void) {
+    Serial.println("⏱️ TX timeout");
+    lora_idle = true;
+    Radio.Sleep();
+    Radio.Rx(0);
+}
