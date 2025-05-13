@@ -1,0 +1,287 @@
+#include "LoRaWan_APP.h"
+#include <Arduino.h>
+#include <vector>
+#include <queue>
+#include <climits>
+#include <string>
+#include <algorithm>
+
+// === Device Configuration ===
+#define MY_NODE_ID 2 // 🔁 Change this per device
+#define RF_FREQUENCY 915000000
+#define TX_OUTPUT_POWER 14
+#define LORA_BANDWIDTH 0
+#define LORA_SPREADING_FACTOR 7
+#define LORA_CODINGRATE 1
+#define LORA_PREAMBLE_LENGTH 8
+#define LORA_SYMBOL_TIMEOUT 0
+#define LORA_FIX_LENGTH_PAYLOAD_ON false
+#define LORA_IQ_INVERSION_ON false
+#define RX_TIMEOUT_VALUE 1000
+#define BUFFER_SIZE 64
+
+char txpacket[BUFFER_SIZE];
+char rxpacket[BUFFER_SIZE];
+bool lora_idle = true;
+
+static RadioEvents_t RadioEvents;
+void OnRxDone(uint8_t* payload, uint16_t size, int16_t rssi, int8_t snr);
+void OnTxDone(void);
+void OnTxTimeout(void);
+
+// === Edge Structure with Timestamp ===
+struct Edge {
+  int neighbor;
+  int cost;
+  unsigned long lastUpdated;  // In millis()
+};
+
+// === Dynamic Graph with RSSI + Timestamp ===
+class DynamicGraph {
+public:
+  std::vector<std::vector<Edge>> adjList;
+
+  DynamicGraph() {}
+  int rssiToCost(int rssi) {
+    return std::max(1, 120 - abs(rssi));
+  }
+
+  void addVertex(int node) {
+    if (node >= adjList.size()) {
+      adjList.resize(node + 1);
+    }
+  }
+
+  bool hasNode(int id) const {
+    return id < adjList.size();
+  }
+
+  void addEdge(int8_t u, int8_t v, int16_t rssi, bool bidirectional = true) {
+    addVertex(u);
+    addVertex(v);
+    int cost = rssiToCost(rssi);
+    unsigned long now = millis();
+
+    auto& neighborsU = adjList[u];
+    auto& neighborsV = adjList[v];
+
+    auto updateOrAdd = [](std::vector<Edge>& neighbors, int node, int cost, unsigned long now) {
+      for (auto& edge : neighbors) {
+        if (edge.neighbor == node) {
+          edge.cost = cost;
+          edge.lastUpdated = now;
+          return;
+        }
+      }
+      neighbors.push_back({ node, cost, now });
+    };
+
+    updateOrAdd(neighborsU, v, cost, now);
+    if (bidirectional) {
+      updateOrAdd(neighborsV, u, cost, now);
+    }
+
+    Serial.printf("🧭 Edge updated: %d <-> %d (cost: %d)\n", u, v, cost);
+  }
+
+  void pruneStaleEdges(unsigned long maxAgeMillis = 30000) {
+    unsigned long now = millis();
+    for (auto& neighbors : adjList) {
+      neighbors.erase(std::remove_if(neighbors.begin(), neighbors.end(),
+                                     [now, maxAgeMillis](const Edge& edge) {
+                                       return (now - edge.lastUpdated > maxAgeMillis);
+                                     }),
+                      neighbors.end());
+    }
+  }
+
+  std::vector<int> dijkstra(int src, int target) {
+    int n = adjList.size();
+    if (src >= n || target >= n) {
+      Serial.printf("❌ Invalid node(s): src=%d, dst=%d, graph size=%d\n", src, target, n);
+      return {};
+    }
+
+    std::vector<int> dist(n, INT_MAX);
+    std::vector<int> parent(n, -1);
+    std::vector<bool> visited(n, false);
+    std::priority_queue<std::pair<int, int>, std::vector<std::pair<int, int>>, std::greater<>> pq;
+
+    dist[src] = 0;
+    pq.push({ 0, src });
+
+    while (!pq.empty()) {
+      int u = pq.top().second;
+      pq.pop();
+      if (visited[u]) continue;
+      visited[u] = true;
+      if (u == target) break;
+
+      for (const auto& edge : adjList[u]) {
+        int v = edge.neighbor;
+        int weight = edge.cost;
+        if (!visited[v] && dist[u] + weight < dist[v]) {
+          dist[v] = dist[u] + weight;
+          parent[v] = u;
+          pq.push({ dist[v], v });
+        }
+      }
+    }
+
+    std::vector<int> path;
+    if (dist[target] == INT_MAX) {
+      Serial.println("❌ No path found.");
+      return path;
+    }
+
+    for (int crawl = target; crawl != -1; crawl = parent[crawl])
+      path.push_back(crawl);
+
+    std::reverse(path.begin(), path.end());
+    Serial.print("📍 Path: ");
+    for (size_t i = 0; i < path.size(); ++i) {
+      Serial.print(path[i]);
+      if (i != path.size() - 1)
+        Serial.print(" -> ");
+    }
+    Serial.printf(" (Distance: %d)\n", dist[target]);
+    return path;
+  }
+};
+
+DynamicGraph network;
+unsigned long lastPrune = 0;
+void printGraph() {
+  Serial.println("🌐 Current Graph:");
+  for (int i = 0; i < network.adjList.size(); ++i) {
+    if (!network.adjList[i].empty()) {
+      Serial.printf("Node %d:", i);
+      for (const auto& edge : network.adjList[i]) {
+        Serial.printf(" -> %d (cost: %d)", edge.neighbor, edge.cost);
+      }
+      Serial.println();
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
+
+  RadioEvents.TxDone = OnTxDone;
+  RadioEvents.TxTimeout = OnTxTimeout;
+  RadioEvents.RxDone = OnRxDone;
+
+  Radio.Init(&RadioEvents);
+  Radio.SetChannel(RF_FREQUENCY);
+
+  Radio.SetRxConfig(MODEM_LORA, LORA_BANDWIDTH, LORA_SPREADING_FACTOR,
+                    LORA_CODINGRATE, 0, LORA_PREAMBLE_LENGTH,
+                    LORA_SYMBOL_TIMEOUT, LORA_FIX_LENGTH_PAYLOAD_ON,
+                    0, true, 0, 0, LORA_IQ_INVERSION_ON, true);
+
+  Radio.SetTxConfig(MODEM_LORA, TX_OUTPUT_POWER, 0, LORA_BANDWIDTH,
+                      LORA_SPREADING_FACTOR, LORA_CODINGRATE,
+                      LORA_PREAMBLE_LENGTH, LORA_FIX_LENGTH_PAYLOAD_ON,
+                      true, 0, 0, LORA_IQ_INVERSION_ON, 3000);
+  Serial.printf("🚀 Node %d is up and listening...\n", MY_NODE_ID);
+  network.addVertex(MY_NODE_ID);
+  printGraph();
+
+  Radio.Rx(0);
+}
+void printNeighbors() {
+  Serial.printf("👀 Neighbors of node %d:\n", MY_NODE_ID);
+  if (MY_NODE_ID >= network.adjList.size()) {
+    Serial.println("No node in graph.");
+    return;
+  }
+  for (const auto& edge : network.adjList[MY_NODE_ID]) {
+    Serial.printf(" -> %d (cost: %d)\n", edge.neighbor, edge.cost);
+  }
+}
+
+// void loop() {
+//   if (lora_idle) {
+//     lora_idle = false;
+//     Serial.println("into RX mode");
+//     Radio.Rx(0);
+//   }
+//   Radio.IrqProcess();
+// }
+
+void loop() {
+  Radio.IrqProcess();
+
+  static unsigned long lastBeacon = 0;
+  if (millis() - lastBeacon > 20000 && lora_idle) {
+    String beacon = String(MY_NODE_ID) + " -> 4: hello";
+    snprintf(txpacket, BUFFER_SIZE, "%s", beacon.c_str());
+
+    Serial.printf("📡 Beacon sent: \"%s\"\n", txpacket);
+    Radio.Send((uint8_t*)txpacket, strlen(txpacket));
+    lora_idle = false;
+    lastBeacon = millis();
+  }
+}
+
+void OnRxDone(uint8_t* payload, uint16_t size, int16_t rssi, int8_t snr) {
+  memcpy(rxpacket, payload, size);
+  rxpacket[size] = '\0';
+
+  Serial.printf("\n📥 Received packet: \"%s\" RSSI: %d, SNR: %d\n", rxpacket, rssi, snr);
+
+  String packet = String(rxpacket);
+  int arrowPos = packet.indexOf(" -> ");
+  int colonPos = packet.indexOf(": ");
+
+  if (arrowPos == -1 || colonPos == -1 || colonPos <= arrowPos) {
+    Serial.println("⚠️ Invalid packet format.");
+    Radio.Rx(0);
+    return;
+  }
+
+  int fromID = packet.substring(0, arrowPos).toInt();
+  int toID = packet.substring(arrowPos + 4, colonPos).toInt();
+  String message = packet.substring(colonPos + 2);
+
+  network.addVertex(fromID);
+  network.addVertex(toID);
+  network.addEdge(fromID, MY_NODE_ID, rssi);
+
+  if (toID == 4) {
+   Serial.println("📶 Received beacon. Edge updated.");
+  } else if (toID == MY_NODE_ID) {
+    Serial.printf("✅ Message for me: %s\n", message.c_str());
+  } else {
+    std::vector<int> path = network.dijkstra(MY_NODE_ID, toID);
+    if (path.size() >= 2) {
+      int nextHop = path[1];
+      snprintf(txpacket, BUFFER_SIZE, "%d -> %d: %s", MY_NODE_ID, toID, message.c_str());
+      Serial.printf("🔁 Forwarding to %d: \"%s\"\n", nextHop, txpacket);
+
+      Radio.SetTxConfig(MODEM_LORA, TX_OUTPUT_POWER, 0, LORA_BANDWIDTH,
+                        LORA_SPREADING_FACTOR, LORA_CODINGRATE,
+                        LORA_PREAMBLE_LENGTH, LORA_FIX_LENGTH_PAYLOAD_ON,
+                        true, 0, 0, LORA_IQ_INVERSION_ON, 3000);
+
+      Radio.Send((uint8_t*)txpacket, strlen(txpacket));
+      lora_idle = false;
+    }
+  }
+
+  Radio.Rx(0);
+}
+
+void OnTxDone(void) {
+  Serial.println("✅ TX complete");
+  lora_idle = true;
+  Radio.Rx(0);
+}
+
+void OnTxTimeout(void) {
+  Serial.println("⏱️ TX Timeout");
+  Radio.Sleep();
+  lora_idle = true;
+  Radio.Rx(0);
+}
